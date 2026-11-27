@@ -232,8 +232,22 @@ Requirements and limitations
   ``indexed_gzip`` installed and both ``.idx`` and ``.gzidx`` sidecars.
   Tar shards must be uncompressed. See :doc:`indexed-manifests`.
 * ``num_workers`` and ``world_size`` must match between save and restore.
+* Shuffled ``DynamicBucketingSampler`` batch order can change between Lhotse
+  versions, even with the same seed. To resume with the same batch order, use
+  the same Lhotse version when saving and restoring.
 * Non-indexed pipelines (eager ``CutSet`` objects and streaming manifests)
   cannot be checkpointed.
+
+On-demand bucket randomization
+******************************
+
+Shuffled dynamic bucketing samples without replacement and performs one random
+selection per requested cut, rather than constructing a full permutation for
+every batch. A sparse dictionary tracks positions remapped by incremental
+Fisher–Yates sampling. For k requested items from an n-item bucket, randomization
+and index bookkeeping are expected O(k). The locked bucket snapshot still costs
+O(n). Full-bucket consumption can be slower than a full shuffle.
+
 
 Background-thread bucket fetching and clean shutdown
 ****************************************************

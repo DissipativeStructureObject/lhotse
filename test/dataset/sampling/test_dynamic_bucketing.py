@@ -1,6 +1,8 @@
 import random
 import threading
 from itertools import islice
+from queue import Queue
+from unittest.mock import patch
 
 import pytest
 
@@ -10,8 +12,70 @@ from lhotse.dataset.sampling.dynamic_bucketing import (
     DynamicBucketingSampler,
     FixedBucketBatchSizeConstraint,
     estimate_duration_buckets,
+    pick_at_random,
 )
 from lhotse.testing.dummies import DummyManifest, dummy_cut
+
+
+@pytest.mark.parametrize(
+    "bucket_size, prefix_size",
+    [(0, 0), (1, 0), (1, 1), (8, 3), (32, 0), (32, 16), (32, 32)],
+)
+def test_pick_at_random_consumes_only_the_requested_prefix(bucket_size, prefix_size):
+    cuts = [dummy_cut(i) for i in range(bucket_size)]
+    bucket = Queue()
+    for cut in cuts:
+        bucket.put(cut)
+
+    indexes = []
+    rng = random.Random(0)
+    with patch.object(rng, "randrange", wraps=rng.randrange) as randrange:
+        samples = pick_at_random(bucket, rng=rng, out_indexes_used=indexes)
+        prefix = list(islice(samples, prefix_size))
+        assert randrange.call_count == prefix_size
+        assert len(indexes) == prefix_size
+        assert prefix == [cuts[i] for i in indexes]
+        sampled = prefix + list(samples)
+
+    assert randrange.call_count == bucket_size
+    assert sorted(indexes) == list(range(bucket_size))
+    assert sampled == [cuts[i] for i in indexes]
+    assert list(bucket.queue) == cuts
+
+
+@pytest.mark.parametrize("bucket_size", [0, 1, 2, 7, 8, 9, 16, 31, 32, 33, 100])
+@pytest.mark.parametrize("seed", [0, 1, 42])
+@pytest.mark.parametrize("paired", [False, True])
+def test_pick_at_random_matches_incremental_fisher_yates(bucket_size, seed, paired):
+    cuts = [dummy_cut(i) for i in range(bucket_size)]
+    items = [(cut, cut) for cut in cuts] if paired else cuts
+    bucket = Queue()
+    for item in items:
+        bucket.put(item)
+
+    rng = random.Random(seed)
+    expected_rng = random.Random(seed)
+    indexes = []
+    samples = pick_at_random(bucket, rng=rng, out_indexes_used=indexes)
+    remaining_indexes = list(range(bucket_size))
+    expected_indexes = []
+    assert indexes == []
+    assert rng.getstate() == expected_rng.getstate()
+    while remaining_indexes:
+        position = expected_rng.randrange(len(remaining_indexes))
+        index = remaining_indexes[position]
+        remaining_indexes[position] = remaining_indexes[-1]
+        remaining_indexes.pop()
+        expected_indexes.append(index)
+
+        assert next(samples) == items[index]
+        assert indexes == expected_indexes
+        assert rng.getstate() == expected_rng.getstate()
+
+    assert list(samples) == []
+    assert rng.getstate() == expected_rng.getstate()
+    assert sorted(indexes) == list(range(bucket_size))
+    assert list(bucket.queue) == items
 
 
 def test_estimate_duration_buckets_2b():
@@ -281,40 +345,18 @@ def test_dynamic_bucketing_sampler_precomputed_duration_bins():
         else:
             c.duration = 2
 
-    # all cuts actually go into bucket 1 and bucket 0 is always empty
+    # The supplied boundary puts both durations in one bucket. Estimating
+    # the boundary instead would separate the durations into two batches.
     sampler = DynamicBucketingSampler(
         cuts,
-        max_duration=5,
+        max_cuts=10,
         num_buckets=2,
         duration_bins=[0.5],
         seed=0,
         shuffle=True,
     )
-    next(iter(sampler))
-
-    batches = [b for b in sampler]
-    sampled_cuts = [c for b in batches for c in b]
-
-    # Invariant: no duplicated cut IDs
-    assert len(set(c.id for b in batches for c in b)) == len(sampled_cuts)
-
-    # Same number of sampled and source cuts.
-    assert len(sampled_cuts) == len(cuts)
-
-    # We sampled 5 batches with this RNG, like the following:
-    assert len(batches) == 4
-
-    assert len(batches[0]) == 2
-    assert sum(c.duration for c in batches[0]) == 4
-
-    assert len(batches[1]) == 4
-    assert sum(c.duration for c in batches[1]) == 5
-
-    assert len(batches[2]) == 2
-    assert sum(c.duration for c in batches[2]) == 3
-
-    assert len(batches[3]) == 2
-    assert sum(c.duration for c in batches[3]) == 3
+    (batch,) = list(sampler)
+    assert sorted(batch.ids) == sorted(cuts.ids)
 
 
 def test_dynamic_bucketing_sampler_max_duration_and_max_cuts():
@@ -759,8 +801,9 @@ def test_dynamic_bucketing_sampler_sync_buckets_iterable_dataset_usage(sync_buck
     cuts0 = CutSet([c for b in batches0 for c in b])
     cuts1 = CutSet([c for b in batches1 for c in b])
 
-    # Invariant: no duplicated cut IDs across ranks
-    assert set(cuts0.ids) & set(cuts1.ids) == set()
+    # Different seeds do not partition the data; check each replica separately.
+    assert len(set(cuts0.ids)) == len(cuts0)
+    assert len(set(cuts1.ids)) == len(cuts1)
 
     if sync_buckets:
         matching_ids = []

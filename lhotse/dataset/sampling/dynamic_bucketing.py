@@ -1077,19 +1077,23 @@ class DynamicBucketer:
 def pick_at_random(
     bucket: Queue,
     rng: random.Random,
-    out_indexes_used: list,
+    out_indexes_used: List[int],
 ) -> Generator[Union[Cut, Tuple[Cut, ...]], None, None]:
-    """
-    Generator which will yield items in a sequence in a random order.
-    It will append the indexes of items yielded during iteration via ``out_used_indexes``.
-    """
+    """Yield items in random order, appending their original bucket indexes."""
     with bucket.mutex:
-        bucket = list(bucket.queue)
-    indexes = list(range(len(bucket)))
-    rng.shuffle(indexes)
-    for idx in indexes:
-        out_indexes_used.append(idx)
-        yield bucket[idx]
+        items = list(bucket.queue)
+
+    # The caller typically consumes only one batch. Do one Fisher–Yates step
+    # per item, tracking only positions that changed from their original index.
+    moved_indexes = {}
+    for last in range(len(items) - 1, -1, -1):
+        position = rng.randrange(last + 1)
+        index = moved_indexes.get(position, position)
+        last_index = moved_indexes.pop(last, last)
+        if position != last:
+            moved_indexes[position] = last_index
+        out_indexes_used.append(index)
+        yield items[index]
 
 
 class BucketsDontHaveEnoughData(Exception):
